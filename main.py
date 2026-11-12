@@ -1,536 +1,383 @@
 #!/usr/bin/env python3
-"""make.fun cutest-picture-01 — 'baby axolotl floating'
+"""make.fun cutest-picture-01 — "Baby sloth in a teacup".
 
-Pure stdlib Python 3. SDF shapes + smoothstep AA, manual PNG encoder
-(zlib + struct, raw RGB scanlines, filter 0). Deterministic: fixed seed.
-1024x1024, target < 1 MiB, < 60 s.
+Pure stdlib PNG writer (zlib + struct, raw RGB, filter 0).
+All shapes are signed distance fields shaded via smoothstep antialiasing.
+Deterministic: fixed constants only, no RNG, no time.
 """
 import math
 import os
-import random
 import struct
 import zlib
 
 W = H = 1024
-AA = 1.2  # anti-alias half-width in px
 
-# ---------------- palette ----------------
-BG_TOP = (150.0, 222.0, 220.0)
-BG_BOT = (28.0, 94.0, 110.0)
-RAY = (215.0, 242.0, 240.0)
-BODY = (255.0, 217.0, 201.0)        # peach  #FFD9C9
-BODY_EDGE = (243.0, 185.0, 158.0)   # shaded peach
-GILL = (255.0, 143.0, 163.0)        # coral  #FF8FA3
-GILL_TIP = (255.0, 182.0, 196.0)
-EYE = (36.0, 30.0, 43.0)
-EYE_RIM = (18.0, 14.0, 24.0)
-WHITE = (255.0, 255.0, 255.0)
-BLUSH = (255.0, 138.0, 150.0)
-HEART = (255.0, 105.0, 130.0)
-BUBBLE = (225.0, 248.0, 246.0)
-GLOW = (255.0, 205.0, 212.0)
+# ---------- palette ----------
+BG_TOP = (255, 218, 192)      # peach
+BG_BOT = (255, 183, 197)      # blush pink
+DOT = (255, 255, 255)
+BODY = (201, 232, 220)        # soft mint
+BODY_DARK = (168, 208, 192)   # mint shade
+CREAM = (255, 243, 224)       # face cream
+PATCH = (86, 74, 96)          # dark sloth eye-patch (plum)
+EYE = (58, 48, 70)
+WHITE = (255, 255, 255)
+NOSE = (120, 96, 110)
+MOUTH = (150, 120, 128)
+MANGO_Y = (255, 202, 88)
+MANGO_O = (255, 152, 74)
+MANGO_SEED = (214, 150, 96)
+MANGO_RIND = (255, 178, 66)
+FLOWER = (255, 226, 110)
+FLOWER_CORE = (255, 176, 92)
+LEAF = (140, 196, 140)
+CUP = (255, 255, 255)
+CUP_SHADE = (245, 224, 228)
+CUP_RIM = (228, 194, 202)
+SAUCER = (252, 238, 240)
+STEAM = (255, 255, 255)
+HEART = (255, 130, 150)
+GLOW = (255, 236, 214)
+FUR = (188, 220, 206)
 
-# ---------------- buffers ----------------
-R = [0.0] * (W * H)
-G = [0.0] * (W * H)
-B = [0.0] * (W * H)
-
-
-def blend(i, r, g, b, a):
-    R[i] += (r - R[i]) * a
-    G[i] += (g - G[i]) * a
-    B[i] += (b - B[i]) * a
-
-
-def add(i, r, g, b, k):
-    R[i] += r * k
-    G[i] += g * k
-    B[i] += b * k
-
-
-def aa_a(d):
-    if d <= -AA:
-        return 1.0
-    if d >= AA:
-        return 0.0
-    t = 0.5 - d / (2.0 * AA)
-    return t * t * (3.0 - 2.0 * t)
-
-
-def clamp01(v):
-    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
-
+# ---------- helpers ----------
+def mix(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
 
 def sstep(e0, e1, x):
-    t = clamp01((x - e0) / (e1 - e0))
-    return t * t * (3.0 - 2.0 * t)
+    t = max(0.0, min(1.0, (x - e0) / (e1 - e0)))
+    return t * t * (3 - 2 * t)
 
+def aa(d, w=1.2):
+    """coverage for sdf d, inside if d<0"""
+    return 1.0 - sstep(-w, w, d)
 
-# ---------------- SDF primitives ----------------
-def sd_circle(dx, dy, r):
-    return math.sqrt(dx * dx + dy * dy) - r
+def smin(a, b, k=12.0):
+    h = max(0.0, min(1.0, 0.5 + 0.5 * (b - a) / k))
+    return b * (1 - h) + a * h - k * h * (1 - h)
 
+def smax(a, b, k=12.0):
+    return -smin(-a, -b, k)
 
-def sd_ellipse(dx, dy, rx, ry):
-    q = math.sqrt(dx * dx / (rx * rx) + dy * dy / (ry * ry))
-    return (q - 1.0) * (rx if rx < ry else ry)
+def sd_circle(px, py, cx, cy, r):
+    return math.hypot(px - cx, py - cy) - r
 
+def sd_ellipse(px, py, cx, cy, rx, ry):
+    k0 = math.hypot((px - cx) / rx, (py - cy) / ry)
+    k1 = math.hypot((px - cx) / (rx * rx), (py - cy) / (ry * ry))
+    return k0 * (k0 - 1.0) / max(k1, 1e-6)
 
-def sd_cap(px, py, ax, ay, bx, by, r):
-    pax = px - ax
-    pay = py - ay
-    bax = bx - ax
-    bay = by - ay
-    bb = bax * bax + bay * bay
-    h = 0.0 if bb == 0.0 else (pax * bax + pay * bay) / bb
-    if h < 0.0:
-        h = 0.0
-    elif h > 1.0:
-        h = 1.0
-    dx = pax - bax * h
-    dy = pay - bay * h
-    return math.sqrt(dx * dx + dy * dy) - r
+def sd_capsule(px, py, ax, ay, bx, by, r):
+    pax, pay = px - ax, py - ay
+    bax, bay = bx - ax, by - ay
+    h = max(0.0, min(1.0, (pax * bax + pay * bay) / max(bax * bax + bay * bay, 1e-6)))
+    return math.hypot(pax - bax * h, pay - bay * h) - r
 
+def sd_box(px, py, cx, cy, hx, hy, rad=0.0):
+    qx, qy = abs(px - cx) - hx + rad, abs(py - cy) - hy + rad
+    return min(max(qx, qy), 0.0) + math.hypot(max(qx, 0), max(qy, 0)) - rad
 
-def sd_arc(px, py, cx, cy, r, a0, a1, th):
-    dx = px - cx
-    dy = py - cy
-    l = math.sqrt(dx * dx + dy * dy)
-    ang = math.atan2(dy, dx)
-    mid = 0.5 * (a0 + a1)
-    half = 0.5 * (a1 - a0)
-    da = ang - mid
-    da = (da + math.pi) % (2.0 * math.pi) - math.pi
-    if abs(da) <= half:
-        return abs(l - r) - th * 0.5
-    ea = a0 if da < 0.0 else a1
-    ex = cx + r * math.cos(ea)
-    ey = cy + r * math.sin(ea)
-    ddx = px - ex
-    ddy = py - ey
-    return math.sqrt(ddx * ddx + ddy * ddy) - th * 0.5
+# ---------- scene geometry ----------
+CUP_CX, CUP_CY = 512.0, 760.0
+CUP_HW, CUP_HH = 250.0, 150.0
+CUP_RAD = 50.0
+HANDLE_CX, HANDLE_CY = CUP_CX + CUP_HW + 40.0, CUP_CY - 40.0
+HANDLE_R = 80.0
+HANDLE_T = 28.0
+SAUCER_CX, SAUCER_CY = CUP_CX, CUP_CY + CUP_HH + 22.0
+SAUCER_HW, SAUCER_HH = 320.0, 28.0
+SAUCER_RAD = 26.0
+HEAD_CX, HEAD_CY = 490.0, 440.0
+HEAD_R = 185.0
+BODY_CX, BODY_CY = 510.0, 600.0
+BODY_RX, BODY_RY = 105.0, 110.0
+EAR_L = (HEAD_CX - 128.0, HEAD_CY - 150.0)
+EAR_R = (HEAD_CX + 128.0, HEAD_CY - 150.0)
+EAR_R2 = 44.0
+PATCH_L_C = (HEAD_CX - 92.0, HEAD_CY - 30.0)
+PATCH_R_C = (HEAD_CX + 92.0, HEAD_CY - 30.0)
+PATCH_RX, PATCH_RY = 72.0, 86.0
+EYE_L_C = (HEAD_CX - 82.0, HEAD_CY - 20.0)
+EYE_R_C = (HEAD_CX + 82.0, HEAD_CY - 20.0)
+EYE_R2 = 38.0
+MANGO_CX, MANGO_CY = HEAD_CX + 138.0, HEAD_CY + 105.0
+MANGO_RX, MANGO_RY = 100.0, 72.0
+MANGO_SEED_CX, MANGO_SEED_CY = MANGO_CX - 30.0, MANGO_CY + 6.0
+MANGO_SEED_RX, MANGO_SEED_RY = 32.0, 44.0
+FLOWER_POS = (EAR_R[0] + 14.0, EAR_R[1] - 24.0)
+FLOWER_R = 32.0
+CHEST_FUR = [(HEAD_CX - 20, 540), (HEAD_CX, 565), (HEAD_CX + 20, 590)]
+STEAM_X = [CUP_CX - 172, CUP_CX + 186]
+HEARTS = [(150, 260, 26), (330, 160, 18), (860, 300, 30), (920, 130, 16)]
+GLOW_CX, GLOW_CY, GLOW_R = CUP_CX, CUP_CY - 60.0, 440.0
 
+# ---------- layer sdfs (d<0 inside) ----------
+def d_glow(px, py):
+    return sd_circle(px, py, GLOW_CX, GLOW_CY, GLOW_R)
 
-# ---------------- creature group transform ----------------
-GCX, GCY = 512.0, 524.0
-TH = 0.11  # floating tilt (radians)
-CA = math.cos(TH)
-SA = math.sin(TH)
+def d_saucer(px, py):
+    return sd_box(px, py, SAUCER_CX, SAUCER_CY, SAUCER_HW, SAUCER_HH, SAUCER_RAD)
 
-# local layout
-HX, HY = -30.0, -70.0      # head center
-HR = 215.0                 # head radius
-BX, BY = 115.0, 95.0       # body center
-BRX, BRY = 130.0, 100.0    # body ellipse
-EYE1 = (HX - 100.0, HY - 40.0)
-EYE2 = (HX + 58.0, HY - 40.0)
-EYE_R = 36.0
-MOUTH = (HX - 20.0, HY + 44.0)
+def d_cup(px, py):
+    return sd_box(px, py, CUP_CX, CUP_CY, CUP_HW, CUP_HH, CUP_RAD)
 
+def d_handle(px, py):
+    d = sd_circle(px, py, HANDLE_CX, HANDLE_CY, HANDLE_R)
+    di = sd_circle(px, py, HANDLE_CX, HANDLE_CY, HANDLE_R - HANDLE_T)
+    return smax(d, -di, 6.0)
 
-def to_local(px, py):
-    dx = px - GCX
-    dy = py - GCY
-    return dx * CA + dy * SA, -dx * SA + dy * CA
+def d_body(px, py):
+    return sd_ellipse(px, py, BODY_CX, BODY_CY, BODY_RX, BODY_RY)
 
-
-def head_sd(lx, ly):
-    return sd_circle(lx - HX, ly - HY, HR)
-
-
-def body_sd(lx, ly):
-    return sd_ellipse(lx - BX, ly - BY, BRX, BRY)
-
-
-def tail_sd(lx, ly):
-    d1 = sd_cap(lx, ly, BX + 100.0, BY + 45.0, BX + 175.0, BY + 80.0, 17.0)
-    d2 = sd_cap(lx, ly, BX + 175.0, BY + 80.0, BX + 225.0, BY + 102.0, 7.0)
-    return d1 if d1 < d2 else d2
-
-
-def creature_sd(lx, ly):
-    d = head_sd(lx, ly)
-    b = body_sd(lx, ly)
-    if b < d:
-        d = b
-    t = tail_sd(lx, ly)
-    if t < d:
-        d = t
+def d_head(px, py):
+    d = sd_circle(px, py, HEAD_CX, HEAD_CY, HEAD_R)
+    for ex, ey in (EAR_L, EAR_R):
+        d = smin(d, sd_circle(px, py, ex, ey, EAR_R2), 10.0)
     return d
 
+def d_patch(px, py, c):
+    d = sd_ellipse(px, py, c[0], c[1], PATCH_RX, PATCH_RY)
+    cut = sd_circle(px, py, c[0], c[1] + 140.0, 110.0)
+    return smax(d, cut, 10.0)
 
-# ---------------- pass 1: background ----------------
-def draw_bg():
-    beams = ((250.0, 0.32, 95.0), (510.0, 0.02, 120.0), (760.0, -0.28, 90.0))
-    for y in range(H):
-        ty = y / (H - 1)
-        br = BG_TOP[0] + (BG_BOT[0] - BG_TOP[0]) * ty
-        bgg = BG_TOP[1] + (BG_BOT[1] - BG_TOP[1]) * ty
-        bb = BG_TOP[2] + (BG_BOT[2] - BG_TOP[2]) * ty
-        strength = 0.11 * math.exp(-y / 620.0)
-        b1x = beams[0][0] + beams[0][1] * y
-        b1s2 = 2.0 * beams[0][2] * beams[0][2]
-        b2x = beams[1][0] + beams[1][1] * y
-        b2s2 = 2.0 * beams[1][2] * beams[1][2]
-        b3x = beams[2][0] + beams[2][1] * y
-        b3s2 = 2.0 * beams[2][2] * beams[2][2]
-        row = y * W
-        for x in range(W):
-            v = strength * (
-                math.exp(-((x - b1x) * (x - b1x)) / b1s2)
-                + math.exp(-((x - b2x) * (x - b2x)) / b2s2)
-                + math.exp(-((x - b3x) * (x - b3x)) / b3s2)
-            )
-            i = row + x
-            R[i] = br + RAY[0] * v
-            G[i] = bgg + RAY[1] * v
-            B[i] = bb + RAY[2] * v
+def d_eye(px, py, c):
+    return sd_circle(px, py, c[0], c[1], EYE_R2)
 
+def d_mango(px, py):
+    return sd_ellipse(px, py, MANGO_CX, MANGO_CY, MANGO_RX, MANGO_RY)
 
-# ---------------- pass 2: soft glow around creature ----------------
-def draw_glow():
-    x0, x1, y0, y1 = 60, 970, 60, 990
-    for y in range(y0, y1):
-        row = y * W
-        for x in range(x0, x1):
-            lx, ly = to_local(x, y)
-            d = creature_sd(lx, ly)
-            if d > 0.0:
-                g = 0.22 * math.exp(-d / 34.0)
-                if g > 0.002:
-                    i = row + x
-                    add(i, GLOW[0], GLOW[1], GLOW[2], g)
+def d_mango_seed(px, py):
+    return sd_ellipse(px, py, MANGO_SEED_CX, MANGO_SEED_CY, MANGO_SEED_RX, MANGO_SEED_RY)
 
+def d_flower(px, py):
+    d = 1e9
+    for i in range(6):
+        a = i * math.pi / 3.0 + 0.3
+        fx = FLOWER_POS[0] + math.cos(a) * FLOWER_R * 0.7
+        fy = FLOWER_POS[1] + math.sin(a) * FLOWER_R * 0.7
+        d = smin(d, sd_circle(px, py, fx, fy, 16.0), 8.0)
+    return d
 
-# ---------------- pass 3: gills (feathery ektorel) ----------------
-def gill_segments():
-    """Build 6 gills: main capsule + 3 feather branches + tip, per side."""
-    segs = []
-    fan = (-60.0, -25.0, 5.0)
-    for side in (1.0, -1.0):
-        for deg in fan:
-            a = math.radians(deg)
-            dx = side * math.cos(a)
-            dy = math.sin(a)
-            L = 100.0 - abs(deg) * 0.45
-            bx = HX + dx * (HR - 30.0)
-            by = HY + dy * (HR - 30.0)
-            ex = bx + dx * L
-            ey = by + dy * L
-            segs.append(((bx, by, ex, ey, 7.5), GILL))
-            for fi, t in enumerate((0.26, 0.44, 0.62, 0.79)):
-                px = bx + dx * L * t
-                py = by + dy * L * t
-                fa = math.radians(40.0 + t * 16.0)
-                if fi % 2 == 0:
-                    fdx = dx * math.cos(fa) - dy * math.sin(fa)
-                    fdy = dx * math.sin(fa) + dy * math.cos(fa)
-                else:
-                    fdx = dx * math.cos(fa) + dy * math.sin(fa)
-                    fdy = -dx * math.sin(fa) + dy * math.cos(fa)
-                flen = 30.0 * (1.0 - 0.45 * t)
-                fr = 3.4 * (1.0 - 0.45 * t)
-                segs.append((
-                    (px - fdx * 3.0, py - fdy * 3.0,
-                     px + fdx * flen, py + fdy * flen, fr),
-                    GILL,
-                ))
-            segs.append(((ex, ey, ex, ey, 5.5), GILL_TIP))
-    return segs
+def d_flower_core(px, py):
+    return sd_circle(px, py, FLOWER_POS[0], FLOWER_POS[1], 13.0)
 
+def d_leaf(px, py):
+    return sd_ellipse(px, py, FLOWER_POS[0] + 34.0, FLOWER_POS[1] + 30.0, 26.0, 12.0)
 
-GILL_SEGS = gill_segments()
+def d_steam(px, py, sx):
+    t = (py - 500.0) / 180.0
+    cx = sx + math.sin(t * 4.0 + sx * 0.01) * 30.0
+    return sd_capsule(px, py, cx, py - 10, cx, py + 10, 11.0)
 
+def d_heart(px, py, hx, hy, s):
+    d1 = sd_circle(px, py, hx - s * 0.5, hy - s * 0.3, s * 0.55)
+    d2 = sd_circle(px, py, hx + s * 0.5, hy - s * 0.3, s * 0.55)
+    d3 = sd_ellipse(px, py, hx, hy + s * 0.35, s * 0.78, s * 0.62)
+    return smin(smin(d1, d2, 6.0), d3, 6.0)
 
-def draw_gills():
-    for side in (0, 1):  # 0: right gills, 1: left gills
-        x0, x1 = (500, 980) if side == 0 else (50, 530)
-        for y in range(140, 620):
-            row = y * W
+# ---------- painter ----------
+def render():
+    """Bbox-driven painter: each shape evaluates its SDF only inside its
+    bounding box, blended in order into float accumulation buffers."""
+    r_buf = [0.0] * (W * H)
+    g_buf = [0.0] * (W * H)
+    b_buf = [0.0] * (W * H)
+
+    def paint(fn, color, alpha_scale, x0, y0, x1, y1, w=1.2):
+        x0 = max(0, int(x0)); y0 = max(0, int(y0))
+        x1 = min(W, int(x1) + 1); y1 = min(H, int(y1) + 1)
+        cr, cg, cb = color
+        for y in range(y0, y1):
+            base = y * W
             for x in range(x0, x1):
-                lx, ly = to_local(x, y)
-                best = 1e9
-                bc = GILL
-                for (ax, ay, bx, by, rr), col in GILL_SEGS:
-                    d = sd_cap(lx, ly, ax, ay, bx, by, rr)
-                    if d < best:
-                        best = d
-                        bc = col
-                if best < AA:
-                    i = row + x
-                    a = aa_a(best)
-                    if a > 0.0:
-                        blend(i, bc[0], bc[1], bc[2], a)
+                a = fn(x, y)
+                if a <= 0.004:
+                    continue
+                a *= alpha_scale
+                if a <= 0.004:
+                    continue
+                if a > 1.0:
+                    a = 1.0
+                i = base + x
+                r_buf[i] += (cr - r_buf[i]) * a
+                g_buf[i] += (cg - g_buf[i]) * a
+                b_buf[i] += (cb - b_buf[i]) * a
 
-
-# ---------------- pass 4: tail + body + head ----------------
-def draw_body_head():
-    x0, x1, y0, y1 = 240, 980, 180, 990
-    for y in range(y0, y1):
-        row = y * W
-        for x in range(x0, x1):
-            lx, ly = to_local(x, y)
-            d = creature_sd(lx, ly)
-            if d >= AA:
-                continue
-            i = row + x
-            a = aa_a(d)
-            if a <= 0.0:
-                continue
-            hd = head_sd(lx, ly)
-            if hd < 0.0:
-                dxh = (lx - HX) / HR
-                dyh = (ly - HY) / HR
-                shade = sstep(-0.35, 0.85, dyh * 0.8 + abs(dxh) * 0.35)
-                r = BODY[0] + (BODY_EDGE[0] - BODY[0]) * shade
-                g = BODY[1] + (BODY_EDGE[1] - BODY[1]) * shade
-                b = BODY[2] + (BODY_EDGE[2] - BODY[2]) * shade
-            elif body_sd(lx, ly) < 0.0:
-                bdx = (lx - BX) / BRX
-                bdy = (ly - BY) / BRY
-                shade = sstep(-0.6, 0.9, bdy * 0.7 + abs(bdx) * 0.4)
-                r = BODY[0] + (BODY_EDGE[0] - BODY[0]) * shade
-                g = BODY[1] + (BODY_EDGE[1] - BODY[1]) * shade
-                b = BODY[2] + (BODY_EDGE[2] - BODY[2]) * shade
-            else:
-                r, g, b = BODY_EDGE
-            blend(i, r, g, b, a)
-
-
-# ---------------- pass 5: shimmer + top highlight ----------------
-def draw_shimmer():
-    cx, cy, rx, ry = HX - 70.0, HY - 150.0, 95.0, 45.0
-    for y in range(200, 480):
-        row = y * W
-        for x in range(260, 760):
-            lx, ly = to_local(x, y)
-            d = sd_ellipse(lx - cx, ly - cy, rx, ry)
-            if d < 10.0:
-                a = sstep(10.0, -25.0, d) * 0.22
-                i = row + x
-                add(i, WHITE[0], WHITE[1], WHITE[2], a)
-    for y in range(180, 900):
-        row = y * W
-        for x in range(240, 990):
-            lx, ly = to_local(x, y)
-            d = head_sd(lx, ly)
-            if -6.0 < d < -0.5 and ly < -30.0:
-                i = row + x
-                add(i, WHITE[0], WHITE[1], WHITE[2], 0.45 * sstep(-0.5, -6.0, d))
-            else:
-                d2 = body_sd(lx, ly)
-                if -6.0 < d2 < -0.5 and ly - BY < -20.0:
-                    i = row + x
-                    add(i, WHITE[0], WHITE[1], WHITE[2], 0.40 * sstep(-0.5, -6.0, d2))
-
-
-# ---------------- pass 6: paw over head ----------------
-def draw_paw():
-    arm = (HX - 20.0, HY - 120.0, HX - 88.0, HY - 208.0, 14.0)
-    px, py, prx, pry = HX - 96.0, HY - 226.0, 37.0, 28.0
-    x0, x1, y0, y1 = 150, 560, 80, 460
-    for y in range(y0, y1):
-        row = y * W
-        for x in range(x0, x1):
-            lx, ly = to_local(x, y)
-            da = sd_cap(lx, ly, arm[0], arm[1], arm[2], arm[3], arm[4])
-            de = sd_ellipse(lx - px, ly - py, prx, pry)
-            d = da if da < de else de
-            if d >= AA:
-                continue
-            i = row + x
-            a = aa_a(d)
-            if a <= 0.0:
-                continue
-            rimb = sstep(-10.0, -1.0, d)
-            r = 255.0 - 14.0 * (1.0 - rimb)
-            g = 224.0 - 30.0 * (1.0 - rimb)
-            b = 210.0 - 32.0 * (1.0 - rimb)
-            blend(i, r, g, b, a)
-            if de < 0.0:
-                for ti in (-1, 0, 1):
-                    tx = px + ti * 16.0
-                    dt = sd_cap(lx, ly, tx, py - 18.0, tx + ti * 4.0, py - 2.0, 1.8)
-                    if dt < 1.8:
-                        ta = aa_a(dt) * 0.35
-                        blend(i, 210.0, 160.0, 145.0, ta)
-
-
-# ---------------- pass 7: eyes, mouth, blush ----------------
-def draw_face():
-    x0, x1, y0, y1 = 150, 900, 220, 700
-    for y in range(y0, y1):
-        row = y * W
-        for x in range(x0, x1):
-            lx, ly = to_local(x, y)
-            i = row + x
-            for ecx, ecy in (EYE1, EYE2):
-                d = sd_circle(lx - ecx, ly - ecy, EYE_R)
-                if d < AA:
-                    a = aa_a(d)
-                    if a > 0.0:
-                        if d > -3.0:
-                            blend(i, EYE_RIM[0], EYE_RIM[1], EYE_RIM[2], a)
-                        else:
-                            blend(i, EYE[0], EYE[1], EYE[2], a)
-                dsh = sd_ellipse(lx - ecx, ly - (ecy + 20.0), 17.0, 7.0)
-                if dsh < 0.0:
-                    add(i, WHITE[0], WHITE[1], WHITE[2], 0.30 * sstep(0.0, -10.0, dsh))
-                dh = sd_circle(lx - (ecx - 13.0), ly - (ecy - 14.0), 12.0)
-                if dh < AA:
-                    a = aa_a(dh)
-                    if a > 0.0:
-                        blend(i, WHITE[0], WHITE[1], WHITE[2], a * 0.97)
-                ds = sd_circle(lx - (ecx + 10.0), ly - (ecy + 7.0), 5.5)
-                if ds < AA:
-                    a = aa_a(ds)
-                    if a > 0.0:
-                        blend(i, WHITE[0], WHITE[1], WHITE[2], a * 0.9)
-            dm = sd_arc(lx, ly, MOUTH[0], MOUTH[1], 17.0, 0.35, 2.79, 7.0)
-            if dm < AA:
-                a = aa_a(dm)
-                if a > 0.0:
-                    blend(i, 130.0, 82.0, 82.0, a)
-            for bcx, bcy in ((HX - 158.0, HY + 32.0), (HX + 116.0, HY + 32.0)):
-                db = sd_ellipse(lx - bcx, ly - bcy, 32.0, 19.0)
-                if db < 14.0:
-                    a = sstep(14.0, -8.0, db) * 0.50
-                    if a > 0.0:
-                        blend(i, BLUSH[0], BLUSH[1], BLUSH[2], a)
-
-
-# ---------------- pass 8: bubbles + specks ----------------
-def draw_bubbles():
-    rng = random.Random(20261112)
-    for _ in range(18):
-        bx = rng.uniform(40.0, 984.0)
-        by = rng.uniform(60.0, 880.0)
-        br = rng.uniform(6.0, 24.0)
-        x0 = max(0, int(bx - br - 3))
-        x1 = min(W - 1, int(bx + br + 3))
-        y0 = max(0, int(by - br - 3))
-        y1 = min(H - 1, int(by + br + 3))
-        for y in range(y0, y1 + 1):
-            row = y * W
-            for x in range(x0, x1 + 1):
-                d = sd_circle(x - bx, y - by, br)
-                i = row + x
-                ring = sstep(2.6, 0.6, abs(d))
-                if ring > 0.0:
-                    blend(i, BUBBLE[0], BUBBLE[1], BUBBLE[2], ring * 0.55)
-                inner = sstep(0.0, -br * 0.8, d)
-                if inner > 0.0:
-                    add(i, BUBBLE[0], BUBBLE[1], BUBBLE[2], inner * 0.10)
-                dspec = sd_circle(x - (bx - br * 0.35), y - (by - br * 0.35), br * 0.18)
-                if dspec < 0.0:
-                    add(i, WHITE[0], WHITE[1], WHITE[2], 0.35)
-    for _ in range(46):
-        sx = rng.uniform(10.0, 1010.0)
-        sy = rng.uniform(10.0, 1010.0)
-        sr = rng.uniform(1.0, 2.6)
-        i = int(sy) * W + int(sx)
-        add(i, WHITE[0], WHITE[1], WHITE[2], 0.16)
-    # a few larger foreground bubbles drifting up
-    for _ in range(6):
-        bx = rng.uniform(120.0, 900.0)
-        by = rng.uniform(300.0, 950.0)
-        br = rng.uniform(26.0, 38.0)
-        for y in range(max(0, int(by - br - 3)), min(H - 1, int(by + br + 3)) + 1):
-            row = y * W
-            for x in range(max(0, int(bx - br - 3)), min(W - 1, int(bx + br + 3)) + 1):
-                d = sd_circle(x - bx, y - by, br)
-                i = row + x
-                ring = sstep(3.2, 1.0, abs(d))
-                if ring > 0.0:
-                    blend(i, BUBBLE[0], BUBBLE[1], BUBBLE[2], ring * 0.45)
-                inner = sstep(0.0, -br * 0.85, d)
-                if inner > 0.0:
-                    add(i, BUBBLE[0], BUBBLE[1], BUBBLE[2], inner * 0.07)
-                dspec = sd_circle(x - (bx - br * 0.35), y - (by - br * 0.35), br * 0.16)
-                if dspec < 0.0:
-                    add(i, WHITE[0], WHITE[1], WHITE[2], 0.3)
-
-
-# ---------------- pass 8b: sparkles ----------------
-def draw_sparkles():
-    spots = ((680.0, 160.0, 9.0), (180.0, 560.0, 7.0), (860.0, 520.0, 8.0))
-    for (sx, sy, s) in spots:
-        for y in range(max(0, int(sy - s - 2)), min(H - 1, int(sy + s + 2)) + 1):
-            row = y * W
-            for x in range(max(0, int(sx - s - 2)), min(W - 1, int(sx + s + 2)) + 1):
-                dx = abs(x - sx)
-                dy = abs(y - sy)
-                star = max(0.0, 1.0 - (dx + dy) / s)
-                star = star * star
-                if star > 0.01:
-                    add(row + x, WHITE[0], WHITE[1], WHITE[2], star * 0.9)
-
-
-# ---------------- pass 9: hearts ----------------
-def draw_hearts():
-    spots = ((300.0, 200.0, 15.0), (760.0, 300.0, 12.0), (250.0, 420.0, 10.0))
-    for (hx, hy, s) in spots:
-        x0 = max(0, int(hx - s * 1.6))
-        x1 = min(W - 1, int(hx + s * 1.6))
-        y0 = max(0, int(hy - s * 1.6))
-        y1 = min(H - 1, int(hy + s * 1.6))
-        for y in range(y0, y1 + 1):
-            row = y * W
-            for x in range(x0, x1 + 1):
-                ux = (x - hx) / s
-                uy = (hy - y) / s
-                f = (ux * ux + uy * uy - 1.0) ** 3 - ux * ux * uy * uy * uy
-                a = sstep(0.9, -0.9, f * 2.2)
-                if a > 0.0:
-                    i = row + x
-                    blend(i, HEART[0], HEART[1], HEART[2], a * 0.9)
-
-
-# ---------------- PNG encode ----------------
-def write_png(path):
-    raw = bytearray()
+    # background gradient (per row, one blend then fill row)
     for y in range(H):
-        raw.append(0)  # filter 0
-        row = y * W
+        t = y / H
+        cr = BG_TOP[0] + (BG_BOT[0] - BG_TOP[0]) * t
+        cg = BG_TOP[1] + (BG_BOT[1] - BG_TOP[1]) * t
+        cb = BG_TOP[2] + (BG_BOT[2] - BG_TOP[2]) * t
+        base = y * W
         for x in range(W):
-            i = row + x
-            r = R[i]
-            g = G[i]
-            b = B[i]
-            raw.append(255 if r > 255.0 else (0 if r < 0.0 else int(r)))
-            raw.append(255 if g > 255.0 else (0 if g < 0.0 else int(g)))
-            raw.append(255 if b > 255.0 else (0 if b < 0.0 else int(b)))
-    comp = zlib.compress(bytes(raw), 6)
+            i = base + x
+            r_buf[i] = cr
+            g_buf[i] = cg
+            b_buf[i] = cb
 
+    # polka dots (faint white)
+    for dx, dy, dr in dots:
+        paint(lambda x, y, dx=dx, dy=dy, dr=dr: aa(sd_circle(x, y, dx, dy, dr)) * 0.35,
+              DOT, 1.0, dx - dr - 3, dy - dr - 3, dx + dr + 3, dy + dr + 3)
+
+    # soft glow behind cup (radial falloff) — before hearts so hearts stay vivid
+    paint(lambda x, y: (1.0 - sstep(0.0, GLOW_R, d_glow(x, y))),
+          GLOW, 0.30, GLOW_CX - GLOW_R - 4, GLOW_CY - GLOW_R - 4,
+          GLOW_CX + GLOW_R + 4, GLOW_CY + GLOW_R + 4)
+
+    # mini hearts
+    for hx, hy, hs in HEARTS:
+        pad = hs + 4
+        paint(lambda x, y, hx=hx, hy=hy, hs=hs: aa(d_heart(x, y, hx, hy, hs)) * 0.9,
+              HEART, 1.0, hx - pad, hy - pad, hx + pad, hy + pad)
+
+    # saucer
+    paint(lambda x, y: aa(d_saucer(x, y)), SAUCER, 1.0,
+          SAUCER_CX - SAUCER_HW - SAUCER_RAD - 4, SAUCER_CY - SAUCER_HH - SAUCER_RAD - 4,
+          SAUCER_CX + SAUCER_HW + SAUCER_RAD + 4, SAUCER_CY + SAUCER_HH + SAUCER_RAD + 4)
+
+    # steam curls (soft white, rising beside the head)
+    for sx in STEAM_X:
+        paint(lambda x, y, sx=sx: aa(d_steam(x, y, sx), 2.0),
+              STEAM, 0.28, sx - 90, 430, sx + 90, 650)
+
+    # ---- sloth body & head ----
+    paint(lambda x, y: aa(d_body(x, y)), BODY, 1.0,
+          BODY_CX - BODY_RX - 4, BODY_CY - BODY_RY - 4,
+          BODY_CX + BODY_RX + 4, BODY_CY + BODY_RY + 4)
+    # chest feather-fur arcs (3)
+    for fx, fy in CHEST_FUR:
+        paint(lambda x, y, fx=fx, fy=fy: aa(sd_capsule(x, y, fx - 26, fy, fx + 26, fy, 5.0)) * 0.8,
+              FUR, 1.0, fx - 34, fy - 8, fx + 34, fy + 8)
+    # body bottom shade
+    paint(lambda x, y: aa(sd_ellipse(x, y, BODY_CX, BODY_CY + 60, BODY_RX - 18, 60)) * 0.4,
+          BODY_DARK, 1.0, BODY_CX - BODY_RX, BODY_CY, BODY_CX + BODY_RX, BODY_CY + BODY_RY + 64)
+
+    # paws resting on the cup rim (claws draped over the front wall)
+    for bx, by in ((BODY_CX - 118, BODY_CY - 4), (BODY_CX + 118, BODY_CY - 2)):
+        paint(lambda x, y, bx=bx, by=by: aa(sd_circle(x, y, bx, by, 44)), BODY_DARK, 1.0,
+              bx - 48, by - 48, bx + 48, by + 48)
+
+    # head (with ears smooth-unioned)
+    paint(lambda x, y: aa(d_head(x, y)), BODY, 1.0,
+          HEAD_CX - HEAD_R - 8, HEAD_CY - HEAD_R - 60,
+          HEAD_CX + HEAD_R + 8, HEAD_CY + HEAD_R + 8)
+    # cream face
+    paint(lambda x, y: aa(sd_ellipse(x, y, HEAD_CX, HEAD_CY + 24, 128, 106)), CREAM, 1.0,
+          HEAD_CX - 132, HEAD_CY - 86, HEAD_CX + 132, HEAD_CY + 134)
+    # dark sloth eye-patches (2, symmetric, curved)
+    for c in (PATCH_L_C, PATCH_R_C):
+        paint(lambda x, y, c=c: aa(d_patch(x, y, c)), PATCH, 1.0,
+              c[0] - PATCH_RX - 6, c[1] - PATCH_RY - 6, c[0] + PATCH_RX + 6, c[1] + 60)
+    # glossy eyes + highlights
+    for c in (EYE_L_C, EYE_R_C):
+        paint(lambda x, y, c=c: aa(d_eye(x, y, c)), EYE, 1.0,
+              c[0] - EYE_R2 - 4, c[1] - EYE_R2 - 4, c[0] + EYE_R2 + 4, c[1] + EYE_R2 + 4)
+        paint(lambda x, y, c=c: aa(sd_circle(x, y, c[0] + 12, c[1] - 14, 12)), WHITE, 1.0,
+              c[0] - 4, c[1] - 30, c[0] + 28, c[1] + 2)
+        paint(lambda x, y, c=c: aa(sd_circle(x, y, c[0] - 10, c[1] + 12, 6)), WHITE, 0.8,
+              c[0] - 20, c[1] + 2, c[0] - 4, c[1] + 22)
+    # nose
+    paint(lambda x, y: aa(sd_ellipse(x, y, HEAD_CX, HEAD_CY + 44, 22, 15)), NOSE, 1.0,
+          HEAD_CX - 26, HEAD_CY + 24, HEAD_CX + 26, HEAD_CY + 64)
+    # smile
+    def smile(x, y):
+        sm = sd_capsule(x, y, HEAD_CX - 24, HEAD_CY + 78, HEAD_CX, HEAD_CY + 88, 6)
+        sm = smin(sm, sd_capsule(x, y, HEAD_CX, HEAD_CY + 88, HEAD_CX + 24, HEAD_CY + 78, 6), 8)
+        return aa(sm)
+    paint(smile, MOUTH, 1.0, HEAD_CX - 34, HEAD_CY + 68, HEAD_CX + 34, HEAD_CY + 98)
+    # ear shading + inner cream
+    for ex, ey in (EAR_L, EAR_R):
+        paint(lambda x, y, ex=ex, ey=ey: aa(sd_circle(x, y, ex, ey, EAR_R2)) * 0.55,
+              BODY_DARK, 1.0, ex - EAR_R2 - 4, ey - EAR_R2 - 4, ex + EAR_R2 + 4, ey + EAR_R2 + 4)
+        paint(lambda x, y, ex=ex, ey=ey: aa(sd_circle(x, y, ex, ey, EAR_R2 * 0.55)),
+              CREAM, 1.0, ex - 30, ey - 30, ex + 30, ey + 30)
+
+    # green leaf tucked under flower
+    paint(lambda x, y: aa(d_leaf(x, y)), LEAF, 1.0,
+          FLOWER_POS[0] + 2, FLOWER_POS[1] + 12, FLOWER_POS[0] + 66, FLOWER_POS[1] + 48)
+    # yellow flower on right ear
+    paint(lambda x, y: aa(d_flower(x, y)), FLOWER, 1.0,
+          FLOWER_POS[0] - 44, FLOWER_POS[1] - 44, FLOWER_POS[0] + 44, FLOWER_POS[1] + 44)
+    paint(lambda x, y: aa(d_flower_core(x, y)), FLOWER_CORE, 1.0,
+          FLOWER_POS[0] - 17, FLOWER_POS[1] - 17, FLOWER_POS[0] + 17, FLOWER_POS[1] + 17)
+
+    # mango slice (held by right paw, below mouth level)
+    paint(lambda x, y: aa(d_mango(x, y)), MANGO_RIND, 1.0,
+          MANGO_CX - MANGO_RX - 4, MANGO_CY - MANGO_RY - 4,
+          MANGO_CX + MANGO_RX + 4, MANGO_CY + MANGO_RY + 4)
+    paint(lambda x, y: aa(sd_ellipse(x, y, MANGO_CX, MANGO_CY, MANGO_RX - 12, MANGO_RY - 12)),
+          MANGO_Y, 1.0, MANGO_CX - MANGO_RX, MANGO_CY - MANGO_RY,
+          MANGO_CX + MANGO_RX, MANGO_CY + MANGO_RY)
+    paint(lambda x, y: aa(sd_ellipse(x, y, MANGO_CX + 40, MANGO_CY - 18, 52, 34)) * 0.7,
+          MANGO_O, 1.0, MANGO_CX - 20, MANGO_CY - 60, MANGO_CX + 100, MANGO_CY + 24)
+    paint(lambda x, y: aa(d_mango_seed(x, y)), MANGO_SEED, 1.0,
+          MANGO_SEED_CX - MANGO_SEED_RX - 4, MANGO_SEED_CY - MANGO_SEED_RY - 4,
+          MANGO_SEED_CX + MANGO_SEED_RX + 4, MANGO_SEED_CY + MANGO_SEED_RY + 4)
+
+    # cup (front wall overlaps sloth bottom — sloth sits IN the cup)
+    paint(lambda x, y: aa(d_cup(x, y)), CUP, 1.0,
+          CUP_CX - CUP_HW - CUP_RAD - 4, CUP_CY - CUP_HH - CUP_RAD - 4,
+          CUP_CX + CUP_HW + CUP_RAD + 4, CUP_CY + CUP_HH + CUP_RAD + 4)
+    paint(lambda x, y: aa(sd_box(x, y, CUP_CX, CUP_CY + CUP_HH - 40, CUP_HW - 16, 40, CUP_RAD - 16)) * 0.55,
+          CUP_SHADE, 1.0, CUP_CX - CUP_HW, CUP_CY + 60, CUP_CX + CUP_HW, CUP_CY + CUP_HH + 4)
+    paint(lambda x, y: aa(sd_box(x, y, CUP_CX, CUP_CY - CUP_HH + 16, CUP_HW - 12, 18, 14)),
+          CUP_RIM, 1.0, CUP_CX - CUP_HW, CUP_CY - CUP_HH - 6, CUP_CX + CUP_HW, CUP_CY - CUP_HH + 40)
+    # cup handle (right side, clear ring)
+    paint(lambda x, y: aa(d_handle(x, y)), CUP, 1.0,
+          HANDLE_CX - HANDLE_R - 4, HANDLE_CY - HANDLE_R - 4,
+          HANDLE_CX + HANDLE_R + 4, HANDLE_CY + HANDLE_R + 4)
+    paint(lambda x, y: aa(sd_circle(x, y, HANDLE_CX, HANDLE_CY, HANDLE_R))
+                       * (1.0 - aa(sd_circle(x, y, HANDLE_CX, HANDLE_CY, HANDLE_R - 10))),
+          CUP_SHADE, 0.6, HANDLE_CX - HANDLE_R, HANDLE_CY - HANDLE_R,
+          HANDLE_CX + HANDLE_R, HANDLE_CY + HANDLE_R)
+
+    # sloth claws draped over the cup front wall (3 per paw)
+    for bx, by in ((BODY_CX - 118, BODY_CY - 4), (BODY_CX + 118, BODY_CY - 2)):
+        for k in range(3):
+            kx = bx - 26 + k * 26
+            paint(lambda x, y, kx=kx, by=by: aa(sd_capsule(x, y, kx, by + 30, kx, by + 52, 5.0)),
+                  CREAM, 1.0, kx - 8, by + 22, kx + 8, by + 58)
+
+    img = bytearray(W * H * 3)
+    idx = 0
+    for i in range(W * H):
+        img[idx] = int(r_buf[i] + 0.5)
+        img[idx + 1] = int(g_buf[i] + 0.5)
+        img[idx + 2] = int(b_buf[i] + 0.5)
+        idx += 3
+    return bytes(img)
+
+
+def write_png(path, raw):
     def chunk(tag, data):
         c = struct.pack(">I", len(data)) + tag + data
         return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", comp)
-    png += chunk(b"IEND", b"")
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    stride = W * 3
+    rows = bytearray()
+    for y in range(H):
+        rows.append(0)
+        rows += raw[y * stride:(y + 1) * stride]
+    idat = zlib.compress(bytes(rows), 6)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+           + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
     with open(path, "wb") as f:
         f.write(png)
-
-
-def main():
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", ".")
-    os.makedirs(outdir, exist_ok=True)
-    draw_bg()
-    draw_glow()
-    draw_gills()
-    draw_body_head()
-    draw_shimmer()
-    draw_paw()
-    draw_face()
-    draw_bubbles()
-    draw_sparkles()
-    draw_hearts()
-    path = os.path.join(outdir, "entry.png")
-    write_png(path)
-    print("wrote", path, os.path.getsize(path), "bytes")
+    return len(png)
 
 
 if __name__ == "__main__":
-    main()
+    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "out")
+    os.makedirs(outdir, exist_ok=True)
+    dots = []
+    for gy in range(7):
+        for gx in range(7):
+            dots.append((60 + gx * 152 + (76 if gy % 2 else 0),
+                         90 + gy * 148, 17))
+    raw = render()
+    path = os.path.join(outdir, "entry.png")
+    n = write_png(path, raw)
+    print(f"wrote {path} ({n} bytes)")
